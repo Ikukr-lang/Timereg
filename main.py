@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
@@ -14,19 +14,20 @@ import aiosqlite
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
-# ====================== ЗАГРУЗКА ТОКЕНА ======================
+# ====================== НАСТРОЙКИ ======================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN не найден в .env файле!")
+    raise ValueError("❌ BOT_TOKEN не найден в файле .env")
 
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 db = None
-scheduler = AsyncIOScheduler()   # ← Создаём планировщик глобально
+
+scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
 # ====================== БАЗА ДАННЫХ ======================
 async def init_db():
@@ -35,7 +36,6 @@ async def init_db():
     await db.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
-            username TEXT,
             start_count INTEGER DEFAULT 0
         )
     """)
@@ -46,11 +46,7 @@ async def init_db():
             name TEXT,
             photo TEXT,
             description TEXT,
-            subscription_end TEXT,
-            specialists TEXT,
-            services TEXT,
-            bindings TEXT,
-            appointments TEXT
+            subscription_end TEXT
         )
     """)
     await db.commit()
@@ -61,18 +57,20 @@ class CreateCompany(StatesGroup):
     photo = State()
     description = State()
 
-# ====================== СЧЁТЧИК ПОЛЬЗОВАТЕЛЕЙ ======================
+# ====================== СЧЁТЧИК ======================
 async def get_start_count():
-    async with db.execute("SELECT SUM(start_count) FROM users") as cursor:
-        row = await cursor.fetchone()
+    async with db.execute("SELECT SUM(start_count) FROM users") as cur:
+        row = await cur.fetchone()
         return row[0] if row else 0
 
-# ====================== СТАРТ ======================
+# ====================== СТАРТ БОТА ======================
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-    await db.execute("UPDATE users SET start_count = start_count + 1 WHERE user_id = ?", (user_id,))
+    await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (message.from_user.id,))
+    await db.execute(
+        "UPDATE users SET start_count = start_count + 1 WHERE user_id = ?",
+        (message.from_user.id,)
+    )
     await db.commit()
 
     count = await get_start_count()
@@ -83,40 +81,38 @@ async def cmd_start(message: Message, state: FSMContext):
     ])
 
     await message.answer_photo(
-        photo="https://i.imgur.com/TIME_REG_LOGO.png",   # ← Замените на свой логотип
+        photo="https://i.imgur.com/TIME_REG_LOGO.png",
         caption=f"👋 Добро пожаловать в **Time Reg**!\n\n"
-                f"📊 Пользователей, запустивших бота: **{count}**\n\n"
-                f"Сервис онлайн-записи к специалистам.",
+                f"📊 Пользователей запустили бота: **{count}**",
         reply_markup=kb
     )
 
-# ====================== ПЛАНИРОВЩИК (теперь запускается правильно) ======================
+# ====================== ПРОВЕРКА ПОДПИСОК ======================
 async def check_subscriptions():
-    if db is None:
+    if not db:
         return
-    async with db.execute("SELECT company_id, subscription_end FROM companies") as cursor:
-        async for row in cursor:
+    async with db.execute("SELECT company_id, subscription_end FROM companies") as cur:
+        async for row in cur:
             try:
-                end_date = datetime.fromisoformat(row[1].replace("Z", "+00:00"))
-                if end_date < datetime.now():
-                    # Здесь будет отключение компании
-                    pass
-                elif end_date < datetime.now() + timedelta(days=1):
-                    # Уведомление за день до окончания
-                    pass
+                end = datetime.fromisoformat(str(row[1]))
+                if end < datetime.now():
+                    print(f"Компания {row[0]} — подписка истекла")
+                elif end < datetime.now() + timedelta(days=1):
+                    print(f"Компания {row[0]} — заканчивается через день")
             except:
                 pass
 
-# ====================== ЗАПУСК БОТА ======================
+# ====================== ЗАПУСК ======================
 async def main():
     await init_db()
-    
-    # Запускаем планировщик ТОЛЬКО после создания event loop
-    scheduler.add_job(check_subscriptions, "interval", hours=1, id="check_subs")
+
+    # Запускаем планировщик ТОЛЬКО здесь
+    scheduler.add_job(check_subscriptions, trigger="interval", hours=1)
     scheduler.start()
 
-    print("✅ Бот Time Reg успешно запущен!")
-    await dp.start_polling(bot)
+    print("✅ Time Reg бот успешно запущен на Bothost!")
+    await dp.start_polling(bot, skip_updates=True)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
