@@ -2,10 +2,10 @@ import asyncio
 import logging
 import os
 import json
-from datetime import datetime, timedelta, date, time
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -31,7 +31,7 @@ async def init_db():
     global db
     db = await aiosqlite.connect("timereg.db")
     await db.execute("PRAGMA journal_mode=WAL")
-
+    
     await db.execute("""
         CREATE TABLE IF NOT EXISTS companies (
             company_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,8 +40,7 @@ async def init_db():
             photo TEXT,
             description TEXT,
             services TEXT DEFAULT '[]',
-            specialists TEXT DEFAULT '[]',
-            appointments TEXT DEFAULT '[]'
+            specialists TEXT DEFAULT '[]'
         )
     """)
     await db.commit()
@@ -54,25 +53,18 @@ class CompanyCreation(StatesGroup):
     services = State()
     specialists = State()
 
-# ====================== КЛАВИАТУРЫ ======================
-def main_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔹 Создать свою компанию", callback_data="create_company")]
-    ])
-
 # ====================== СТАРТ ======================
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
-    if message.text and "comp_" in message.text:
-        company_id = int(message.text.split("comp_")[1])
-        await show_company(message, company_id)
-        return
-
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔹 Создать свою компанию", callback_data="create_company")]
+    ])
+    
     await message.answer_photo(
         photo="https://i.imgur.com/TIME_REG_LOGO.png",
         caption="👋 Добро пожаловать в **Time Reg** — сервис онлайн-записи!\n\n"
-                "Создайте свою компанию или запишитесь по ссылке.",
-        reply_markup=main_menu()
+                "Нажмите кнопку ниже, чтобы создать компанию.",
+        reply_markup=kb
     )
 
 # ====================== СОЗДАНИЕ КОМПАНИИ ======================
@@ -96,6 +88,7 @@ async def process_photo(message: Message, state: FSMContext):
 @dp.message(CompanyCreation.description)
 async def process_description(message: Message, state: FSMContext):
     data = await state.get_data()
+    
     async with db.execute(
         "INSERT INTO companies (owner_id, name, photo, description) VALUES (?, ?, ?, ?)",
         (message.from_user.id, data["name"], data["photo"], message.text)
@@ -106,56 +99,65 @@ async def process_description(message: Message, state: FSMContext):
     await state.update_data(company_id=company_id)
     await message.answer(
         "✅ Компания создана!\n\n"
-        "Теперь добавляйте **услуги** по одной строке в формате:\n"
-        "`Название | длительность (мин) | цена`\n"
-        "Пример: Массаж спины | 60 | 2500\n\n"
-        "Напишите **готово**, когда закончите."
+        "Добавляйте услуги по одной в формате:\n"
+        "`Название | длительность в минутах | цена`\n"
+        "Пример: Массаж | 60 | 2500\n\n"
+        "Когда все услуги добавите — напишите слово **готово**"
     )
     await state.set_state(CompanyCreation.services)
 
+# ====================== ДОБАВЛЕНИЕ УСЛУГ ======================
 @dp.message(CompanyCreation.services)
 async def add_service(message: Message, state: FSMContext):
     data = await state.get_data()
-    if message.text.lower() == "готово":
+    
+    if message.text.lower().strip() == "готово":
         await message.answer(
-            "Отлично! Теперь добавляйте **специалистов**.\n"
-            "Формат: `Фамилия Имя`\n"
-            "Можно отправить фото перед текстом.\n\n"
-            "Напишите **готово**, когда закончите."
+            "Хорошо! Теперь добавляйте специалистов.\n\n"
+            "Формат: Фамилия Имя\n"
+            "Можно отправить фото специалиста перед текстом.\n\n"
+            "Когда закончите — напишите **готово**"
         )
         await state.set_state(CompanyCreation.specialists)
         return
 
     try:
-        parts = [p.strip() for p in message.text.split("|")]
-        service = {"name": parts[0], "duration": int(parts[1]), "price": int(parts[2])}
+        name, duration, price = [x.strip() for x in message.text.split("|")]
+        service = {"name": name, "duration": int(duration), "price": int(price)}
+        
         services = data.get("services", [])
         services.append(service)
         await state.update_data(services=services)
-        await message.answer(f"✅ Добавлена услуга: {service['name']}")
+        
+        await message.answer(f"✅ Услуга добавлена: {name} ({duration} мин, {price} ₽)")
     except:
-        await message.answer("❌ Неверный формат. Используйте: Название | минуты | цена")
+        await message.answer("❌ Неверный формат!\nИспользуйте: Название | минуты | цена")
 
+# ====================== ДОБАВЛЕНИЕ СПЕЦИАЛИСТОВ ======================
 @dp.message(CompanyCreation.specialists)
 async def add_specialist(message: Message, state: FSMContext):
     data = await state.get_data()
-    if message.text.lower() == "готово":
-        await save_company_and_give_link(message, state)
+    
+    if message.text.lower().strip() == "готово":
+        await finish_creation(message, state)
         await state.clear()
         return
 
     photo = message.photo[-1].file_id if message.photo else None
-    spec = {"name": message.text.strip(), "photo": photo}
+    specialist = {"name": message.text.strip(), "photo": photo}
+    
     specialists = data.get("specialists", [])
-    specialists.append(spec)
+    specialists.append(specialist)
     await state.update_data(specialists=specialists)
-    await message.answer(f"✅ Специалист добавлен: {spec['name']}")
+    
+    await message.answer(f"✅ Специалист добавлен: {specialist['name']}")
 
-async def save_company_and_give_link(message: Message, state: FSMContext):
+async def finish_creation(message: Message, state: FSMContext):
     data = await state.get_data()
+    
     await db.execute(
         "UPDATE companies SET services = ?, specialists = ? WHERE company_id = ?",
-        (json.dumps(data["services"]), json.dumps(data["specialists"]), data["company_id"])
+        (json.dumps(data.get("services", [])), json.dumps(data.get("specialists", [])), data["company_id"])
     )
     await db.commit()
 
@@ -164,38 +166,15 @@ async def save_company_and_give_link(message: Message, state: FSMContext):
 
     await message.answer(
         f"🎉 Компания успешно создана!\n\n"
-        f"🔗 Ваша ссылка для записи:\n`{link}`\n\n"
-        f"Отправьте её клиентам — они смогут выбрать услугу, специалиста и время.",
+        f"🔗 Ссылка для клиентов:\n`{link}`\n\n"
+        f"Теперь другие пользователи могут переходить по ней и записываться.",
         parse_mode="Markdown"
     )
-
-# ====================== ПОКАЗ КОМПАНИИ ДЛЯ ЗАПИСИ ======================
-async def show_company(message: Message, company_id: int):
-    async with db.execute("SELECT name, photo, services, specialists FROM companies WHERE company_id = ?", (company_id,)) as cur:
-        row = await cur.fetchone()
-        if not row:
-            await message.answer("Компания не найдена.")
-            return
-
-        name, photo, services_json, specialists_json = row
-        services = json.loads(services_json) if services_json else []
-        specialists = json.loads(specialists_json) if specialists_json else []
-
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=s["name"], callback_data=f"choose_service_{company_id}_{i}")]
-            for i, s in enumerate(services)
-        ])
-
-        await message.answer_photo(
-            photo=photo,
-            caption=f"🏢 {name}\n\nВыберите услугу:",
-            reply_markup=kb
-        )
 
 # ====================== ЗАПУСК ======================
 async def main():
     await init_db()
-    print("✅ Сервис онлайн-записи Time Reg запущен успешно!")
+    print("✅ Time Reg бот запущен!")
     await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
