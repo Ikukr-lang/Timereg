@@ -18,7 +18,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN не найден в .env файле!")
+    raise ValueError("❌ BOT_TOKEN не найден в .env")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -39,60 +39,50 @@ async def init_db():
             name TEXT,
             photo TEXT,
             description TEXT,
-            subscription_end TEXT,
-            max_specialists INTEGER DEFAULT 1,
-            specialists TEXT DEFAULT '[]',
             services TEXT DEFAULT '[]',
-            bindings TEXT DEFAULT '[]',
-            appointments TEXT DEFAULT '[]'
+            specialists TEXT DEFAULT '[]',
+            subscription_end TEXT,
+            max_specialists INTEGER DEFAULT 5
         )
     """)
     await db.commit()
 
-# ====================== СОСТОЯНИЯ ======================
+# ====================== FSM СОСТОЯНИЯ ======================
 class CreateCompany(StatesGroup):
     name = State()
     photo = State()
     description = State()
+    waiting_for_services = State()   # добавление услуг
+    waiting_for_specialists = State() # добавление специалистов
 
-# ====================== КЛАВИАТУРА ПОДПИСОК ======================
-def subscription_keyboard(company_id: int):
+# ====================== КЛАВИАТУРЫ ======================
+def finish_keyboard(company_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="7 дней — бесплатно", callback_data=f"sub_free_{company_id}")],
-        [InlineKeyboardButton(text="1 специалист — ~150₽/мес", callback_data=f"sub_1_{company_id}")],
-        [InlineKeyboardButton(text="2-3 специалиста — ~250₽/мес", callback_data=f"sub_3_{company_id}")],
-        [InlineKeyboardButton(text="4-5 специалистов — ~350₽/мес", callback_data=f"sub_5_{company_id}")],
-        [InlineKeyboardButton(text="6-7 специалистов — ~450₽/мес", callback_data=f"sub_7_{company_id}")],
-        [InlineKeyboardButton(text="8-10 специалистов — ~550₽/мес", callback_data=f"sub_10_{company_id}")],
-        [InlineKeyboardButton(text="11-15 специалистов — ~750₽/мес", callback_data=f"sub_15_{company_id}")],
-        [InlineKeyboardButton(text="16-20 специалистов — ~1000₽/мес", callback_data=f"sub_20_{company_id}")],
+        [InlineKeyboardButton(text="✅ Завершить создание и получить ссылку", callback_data=f"finish_create_{company_id}")]
     ])
 
 # ====================== СТАРТ ======================
 @dp.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext):
+async def cmd_start(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔹 Создать компанию", callback_data="create_company")],
-        [InlineKeyboardButton(text="🛠 Поддержка", callback_data="support")]
+        [InlineKeyboardButton(text="🔹 Создать компанию", callback_data="create_company")]
     ])
-    
     await message.answer_photo(
         photo="https://i.imgur.com/TIME_REG_LOGO.png",
-        caption="👋 Добро пожаловать в **Time Reg**!\n\n"
-                "Сервис онлайн-записи к специалистам.",
+        caption="👋 Добро пожаловать в **Time Reg**!\nСервис онлайн-записи.",
         reply_markup=kb
     )
 
 # ====================== СОЗДАНИЕ КОМПАНИИ ======================
 @dp.callback_query(F.data == "create_company")
 async def start_create(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Введите название вашей компании:")
+    await callback.message.edit_text("Введите название компании:")
     await state.set_state(CreateCompany.name)
 
 @dp.message(CreateCompany.name)
 async def process_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text)
-    await message.answer("Отправьте фото компании (будет отображаться кругом):")
+    await state.update_data(name=message.text, services=[], specialists=[])
+    await message.answer("Отправьте фото компании:")
     await state.set_state(CreateCompany.photo)
 
 @dp.message(CreateCompany.photo, F.photo)
@@ -102,82 +92,98 @@ async def process_photo(message: Message, state: FSMContext):
     await state.set_state(CreateCompany.description)
 
 @dp.message(CreateCompany.description)
-async def process_desc(message: Message, state: FSMContext):
+async def process_description(message: Message, state: FSMContext):
     data = await state.get_data()
     
     async with db.execute(
-        """INSERT INTO companies 
-           (owner_id, name, photo, description, subscription_end, max_specialists)
-           VALUES (?, ?, ?, ?, ?, 1)""",
-        (message.from_user.id, data["name"], data["photo"], message.text, 
+        """INSERT INTO companies (owner_id, name, photo, description, subscription_end)
+           VALUES (?, ?, ?, ?, ?)""",
+        (message.from_user.id, data['name'], data['photo'], message.text,
          (datetime.now() + timedelta(days=7)).isoformat())
     ) as cur:
         company_id = cur.lastrowid
     await db.commit()
 
-    await message.answer(
-        f"✅ Компания «{data['name']}» успешно создана!\n\n"
-        f"Выберите тариф для активации:",
-        reply_markup=subscription_keyboard(company_id)
-    )
-    await state.clear()
-
-# ====================== ОБРАБОТКА ПОДПИСКИ ======================
-@dp.callback_query(F.data.startswith("sub_"))
-async def activate_subscription(callback: CallbackQuery):
-    _, plan, company_id = callback.data.split("_")
-    company_id = int(company_id)
-
-    months = 1
-    if plan == "free":
-        days = 7
-        max_spec = 1
-    else:
-        days = 30
-        max_spec = {"1":1, "3":3, "5":5, "7":7, "10":10, "15":15, "20":20}.get(plan, 1)
-
-    end_date = datetime.now() + timedelta(days=days)
-
-    await db.execute(
-        "UPDATE companies SET subscription_end = ?, max_specialists = ? WHERE company_id = ?",
-        (end_date.isoformat(), max_spec, company_id)
-    )
-    await db.commit()
-
-    await callback.message.edit_text(
-        f"✅ Подписка активирована!\n\n"
-        f"Действует до: {end_date.strftime('%d.%m.%Y')}\n"
-        f"Максимум специалистов: {max_spec}\n\n"
-        f"Теперь доступна админ-панель вашей компании."
-    )
-
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👥 Специалисты", callback_data=f"adm_spec_{company_id}")],
-        [InlineKeyboardButton(text="🛍 Услуги", callback_data=f"adm_serv_{company_id}")],
-        [InlineKeyboardButton(text="🏪 Витрина", callback_data=f"adm_vit_{company_id}")],
-        [InlineKeyboardButton(text="🔗 Привязка услуг", callback_data=f"adm_bind_{company_id}")],
-        [InlineKeyboardButton(text="📅 Записи", callback_data=f"adm_app_{company_id}")],
-        [InlineKeyboardButton(text="🔗 Ссылка на компанию", callback_data=f"get_link_{company_id}")],
-    ])
+    await state.update_data(company_id=company_id)
     
-    await callback.message.answer("🛠 Админ-панель компании:", reply_markup=admin_kb)
-
-# ====================== ССЫЛКА НА КОМПАНИЮ ======================
-@dp.callback_query(F.data.startswith("get_link_"))
-async def send_link(callback: CallbackQuery):
-    company_id = int(callback.data.split("_")[2])
-    me = await bot.get_me()
-    link = f"https://t.me/{me.username}?start=comp_{company_id}"
-    await callback.message.answer(
-        f"🔗 Ссылка на вашу компанию:\n\n`{link}`\n\n"
-        f"Отправьте её клиентам для записи.", 
+    await message.answer(
+        "✅ Компания создана!\n\n"
+        "Теперь добавляйте **услуги**.\n\n"
+        "Отправляйте в формате:\n"
+        "`Название услуги | 60 | 1500`\n"
+        "(где 60 — длительность в минутах, 1500 — цена в рублях)\n\n"
+        "Когда закончите — напишите слово: **готово**",
         parse_mode="Markdown"
     )
+    await state.set_state(CreateCompany.waiting_for_services)
+
+# ====================== ДОБАВЛЕНИЕ УСЛУГ ======================
+@dp.message(CreateCompany.waiting_for_services)
+async def add_service(message: Message, state: FSMContext):
+    data = await state.get_data()
+    if message.text.lower() == "готово":
+        await message.answer(
+            "Отлично! Теперь добавляйте **специалистов**.\n\n"
+            "Отправляйте в формате:\n"
+            "`Фамилия Имя | @username` или просто `Фамилия Имя`\n"
+            "Можно отправить фото специалиста перед текстом.\n\n"
+            "Когда закончите — напишите **готово**"
+        )
+        await state.set_state(CreateCompany.waiting_for_specialists)
+        return
+
+    try:
+        name, duration, price = [x.strip() for x in message.text.split("|")]
+        duration = int(duration)
+        price = int(price)
+        
+        services = data.get("services", [])
+        services.append({"name": name, "duration": duration, "price": price})
+        await state.update_data(services=services)
+
+        await message.answer(f"✅ Услуга добавлена:\n{name} — {duration} мин — {price} ₽")
+    except:
+        await message.answer("❌ Неверный формат. Используйте:\nНазвание | длительность | цена")
+
+# ====================== ДОБАВЛЕНИЕ СПЕЦИАЛИСТОВ ======================
+@dp.message(CreateCompany.waiting_for_specialists)
+async def add_specialist(message: Message, state: FSMContext):
+    data = await state.get_data()
+    if message.text.lower() == "готово":
+        # Сохраняем всё в базу
+        await db.execute(
+            "UPDATE companies SET services = ?, specialists = ? WHERE company_id = ?",
+            (json.dumps(data["services"]), json.dumps(data["specialists"]), data["company_id"])
+        )
+        await db.commit()
+
+        me = await bot.get_me()
+        link = f"https://t.me/{me.username}?start=comp_{data['company_id']}"
+        
+        await message.answer(
+            f"🎉 Компания полностью создана!\n\n"
+            f"🔗 **Ссылка для клиентов**:\n`{link}`\n\n"
+            f"Отправьте эту ссылку тем, кто хочет записаться.\n"
+            f"Они увидят ваши услуги, специалистов и смогут выбрать время.",
+            parse_mode="Markdown"
+        )
+        await state.clear()
+        return
+
+    # Пока простое добавление (фото + текст)
+    photo = message.photo[-1].file_id if message.photo else None
+    name = message.text.strip()
+
+    specialists = data.get("specialists", [])
+    specialists.append({"name": name, "photo": photo})
+    await state.update_data(specialists=specialists)
+
+    await message.answer(f"✅ Специалист добавлен: {name}")
 
 # ====================== ЗАПУСК ======================
 async def main():
     await init_db()
-    print("✅ Time Reg бот успешно запущен на Bothost!")
+    print("✅ Time Reg бот запущен! Процесс создания компании обновлён.")
     await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
